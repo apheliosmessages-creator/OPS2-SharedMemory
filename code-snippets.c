@@ -1,250 +1,121 @@
-#define _GNU_SOURCE
-#include <math.h>
-#include <pthread.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <semaphore.h>
-#include <signal.h>
-#include <string.h>
-#include <errno.h>
-#include <time.h>
+// 2. Shared Memory Allocation
+// A. Anonymous Shared Memory (For Mutexes/Barriers)
+// Used when parent and children share memory, but no external processes need access.
+// Allocation
+my_struct_t *shared = mmap(NULL, sizeof(my_struct_t), 
+                           PROT_READ | PROT_WRITE, 
+                           MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+if (shared == MAP_FAILED) ERR("mmap anonymous");
 
-#define ERR(source) \
-    (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), kill(0, SIGKILL), exit(EXIT_FAILURE))
+// Cleanup
+munmap(shared, sizeof(my_struct_t));
 
-#define SHM_NAME "/mc_shm"
-#define SEM_NAME "/mc_init_sem"
+// B. Named Shared Memory (For Data Arrays)
 
-// Shared memory structure
-typedef struct {
-    pthread_mutex_t mtx;
-    int process_count;
-    uint64_t total_points;
-    uint64_t hit_points;
-    float a;
-    float b;
-} shm_data_t;
+// Used when independent processes need to attach to the same memory block using a string name.
+
+// 1. Open / Create
+int shm_fd = shm_open("/my_shm_name", O_CREAT | O_RDWR, 0666);
+if (shm_fd == -1) ERR("shm_open");
+
+// 2. Set Size (CRITICAL: Do this only once in the creator process!)
+if (ftruncate(shm_fd, sizeof(double) * array_size) == -1) ERR("ftruncate");
+
+// 3. Map into memory
+double *data = mmap(NULL, sizeof(double) * array_size, 
+                    PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+if (data == MAP_FAILED) ERR("mmap named");
+
+// Cleanup
+munmap(data, sizeof(double) * array_size);
+close(shm_fd);
+shm_unlink("/my_shm_name"); // Only the very last process does this
+
+// 3. Robust Mutexes (Process-Shared & Crash-Proof)
+
+pthread_mutexattr_t mattr;
+pthread_mutexattr_init(&mattr);
+pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED); // Share across forks
+pthread_mutexattr_setrobust(&mattr, PTHREAD_MUTEX_ROBUST);    // Handle sudden deaths
+
+if (pthread_mutex_init(&shared->mtx, &mattr) != 0) ERR("mutex_init");
+pthread_mutexattr_destroy(&mattr);
+
+// Locking and Handling Dead Owners:
+int rc = pthread_mutex_lock(&shared->mtx);
+if (rc == EOWNERDEAD) {
+    // A process died holding the lock! We now own it, but state is inconsistent.
+    printf("Recovering from a dead process!\n");
+    
+    // TODO: Fix any broken shared variables here (e.g., decrement process counter)
+    
+    // Repair the mutex so future locks work normally
+    pthread_mutex_consistent(&shared->mtx); 
+} else if (rc != 0) {
+    ERR("mutex_lock");
+}
+
+// ... Do critical section work ...
+
+pthread_mutex_unlock(&shared->mtx);
+
+
+// 4. Process-Shared Barriers
+
+pthread_barrierattr_t battr;
+pthread_barrierattr_init(&battr);
+pthread_barrierattr_setpshared(&battr, PTHREAD_PROCESS_SHARED);
+
+// Wait for exactly (N_CHILDREN + 1_PARENT) processes
+if (pthread_barrier_init(&shared->barrier, &battr, n + 1) != 0) ERR("barrier_init");
+pthread_barrierattr_destroy(&battr);
+
+//Waiting
+int rc = pthread_barrier_wait(&shared->barrier);
+if (rc != 0 && rc != PTHREAD_BARRIER_SERIAL_THREAD) ERR("barrier_wait");
+
+
+// 5. Named Semaphores
+
+// Open or Create (Initializes to CAPACITY)
+sem_t *my_sem = sem_open("/my_sem_name", O_CREAT, 0666, CAPACITY);
+if (my_sem == SEM_FAILED) ERR("sem_open");
+
+// Use
+if (sem_wait(my_sem) == -1) ERR("sem_wait");
+// ... work ...
+if (sem_post(my_sem) == -1) ERR("sem_post");
+
+// Cleanup
+sem_close(my_sem);
+sem_unlink("/my_sem_name"); // Only call this once at the end of the program
+
+// 6. Waiting for Children (Interrupt-Safe)
+// When waiting for children, wait() might return an error if a signal (like SIGINT) interrupts it. Always handle EINTR.
+
+int remaining = n;
+while (remaining > 0) {
+    if (wait(NULL) == -1) {
+        if (errno == EINTR) continue; // It was just a signal, keep waiting
+        ERR("wait");
+    }
+    remaining--;
+}
+
+// 7. Signal Handling (Graceful Shutdown)
+// Use sigaction instead of the older signal() function for POSIX compliance.
 
 volatile sig_atomic_t keep_running = 1;
 
-void sigint_handler(int sig)
-{
+void sigint_handler(int sig) {
     keep_running = 0;
 }
 
-// Values of this function are in range (0,1]
-double func(double x)
-{
-    usleep(2000);
-    return exp(-x * x);
-}
+// In main():
+struct sigaction sa;
+sa.sa_handler = sigint_handler;
+sigemptyset(&sa.sa_mask);
+sa.sa_flags = 0;
+if (sigaction(SIGINT, &sa, NULL) == -1) ERR("sigaction");
 
-/**
- * It counts hit points by Monte Carlo method.
- * Use it to process one batch of computation.
- * @param N Number of points to randomize
- * @param a Lower bound of integration
- * @param b Upper bound of integration
- * @return Number of points which was hit.
- */
-int randomize_points(int N, float a, float b)
-{
-    int result = 0;
-    for (int i = 0; i < N; ++i)
-    {
-        double rand_x = ((double)rand() / RAND_MAX) * (b - a) + a;
-        double rand_y = ((double)rand() / RAND_MAX);
-        double real_y = func(rand_x);
-
-        if (rand_y <= real_y)
-            result++;
-    }
-    return result;
-}
-
-/**
- * This function calculates approximation of integral from counters of hit and total points.
- * @param total_randomized_points Number of total randomized points.
- * @param hit_points Number of hit points.
- * @param a Lower bound of integration
- * @param b Upper bound of integration
- * @return The approximation of integral
- */
-double summarize_calculations(uint64_t total_randomized_points, uint64_t hit_points, float a, float b)
-{
-    if (total_randomized_points == 0) return 0.0;
-    return (b - a) * ((double)hit_points / (double)total_randomized_points);
-}
-
-/**
- * This function locks mutex and can sometime die (it has 2% chance to die).
- * It cannot die if lock would return an error.
- * It doesn't handle any errors. It's users responsibility.
- * Use it only in STAGE 4.
- *
- * @param mtx Mutex to lock
- * @return Value returned from pthread_mutex_lock.
- */
-int random_death_lock(pthread_mutex_t* mtx)
-{
-    int ret = pthread_mutex_lock(mtx);
-    if (ret)
-        return ret;
-
-    // 2% chance to die
-    if (rand() % 50 == 0)
-        abort();
-    return ret;
-}
-
-void usage(char* argv[])
-{
-    printf("%s a b N - calculating integral with multiple processes\n", argv[0]);
-    printf("a - Start of segment for integral (default: -1)\n");
-    printf("b - End of segment for integral (default: 1)\n");
-    printf("N - Size of batch to calculate before reporting to shared memory (default: 1000)\n");
-}
-
-int main(int argc, char* argv[])
-{
-    // Default arguments
-    float a = -1.0f;
-    float b = 1.0f;
-    int N = 1000;
-
-    if (argc > 1) a = atof(argv[1]);
-    if (argc > 2) b = atof(argv[2]);
-    if (argc > 3) N = atoi(argv[3]);
-
-    srand(getpid() ^ time(NULL));
-
-    // Setup SIGINT handler (Stage 3)
-    struct sigaction sa;
-    sa.sa_handler = sigint_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    if (sigaction(SIGINT, &sa, NULL) == -1) ERR("sigaction");
-
-    // Initialization Phase (Stage 1)
-    // Create/Open semaphore to prevent race conditions during shared memory creation
-    sem_t *init_sem = sem_open(SEM_NAME, O_CREAT, 0666, 1);
-    if (init_sem == SEM_FAILED) ERR("sem_open");
-
-    if (sem_wait(init_sem) == -1) ERR("sem_wait");
-
-    int is_creator = 0;
-    int fd = shm_open(SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0666);
-    if (fd >= 0) {
-        is_creator = 1;
-        if (ftruncate(fd, sizeof(shm_data_t)) == -1) ERR("ftruncate");
-    } else if (errno == EEXIST) {
-        fd = shm_open(SHM_NAME, O_RDWR, 0666);
-        if (fd == -1) ERR("shm_open existing");
-    } else {
-        ERR("shm_open creation");
-    }
-
-    shm_data_t *data = mmap(NULL, sizeof(shm_data_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) ERR("mmap");
-
-    if (is_creator) {
-        // Init Robust Mutex
-        pthread_mutexattr_t attr;
-        pthread_mutexattr_init(&attr);
-        pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-        pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-        
-        if (pthread_mutex_init(&data->mtx, &attr) != 0) ERR("pthread_mutex_init");
-        pthread_mutexattr_destroy(&attr);
-
-        data->process_count = 1;
-        data->total_points = 0;
-        data->hit_points = 0;
-        data->a = a;
-        data->b = b;
-    } else {
-        // Joiner checks limits and increments count
-        data->process_count++;
-        if (data->a != a || data->b != b) {
-            fprintf(stderr, "Warning: Process bounds differ from shared memory bounds. Overriding local bounds.\n");
-            a = data->a;
-            b = data->b;
-        }
-    }
-
-    printf("Collaborating processes: %d\n", data->process_count);
-    if (sem_post(init_sem) == -1) ERR("sem_post");
-
-    // Stage 1 required a 2 sec sleep. Keeping it briefly before loop starts.
-    sleep(2);
-
-    // Computation Loop (Stages 2, 3, 4)
-    while (keep_running) {
-        int hits = randomize_points(N, a, b);
-
-        // Stage 4: Use random_death_lock to simulate crashes
-        int ret = random_death_lock(&data->mtx);
-        if (ret == EOWNERDEAD) {
-            fprintf(stderr, "\n[Process %d] Detected previous owner death. Decrementing ghost process count.\n", getpid());
-            data->process_count--; // Decrement because the dead process couldn't do it
-            pthread_mutex_consistent(&data->mtx);
-        } else if (ret != 0) {
-            ERR("random_death_lock");
-        }
-
-        // Inside Critical Section
-        data->hit_points += hits;
-        data->total_points += N;
-        printf("PID: %d | Computed Batch! Total Samples: %lu | Hits: %lu\n", getpid(), data->total_points, data->hit_points);
-
-        if (pthread_mutex_unlock(&data->mtx) != 0) ERR("pthread_mutex_unlock");
-    }
-
-    // Finalization / Clean up
-    printf("\nProcess %d detaching...\n", getpid());
-
-    int ret = pthread_mutex_lock(&data->mtx);
-    if (ret == EOWNERDEAD) {
-        data->process_count--;
-        pthread_mutex_consistent(&data->mtx);
-    } else if (ret != 0) {
-        ERR("pthread_mutex_lock cleanup");
-    }
-
-    data->process_count--;
-    int current_count = data->process_count;
-    uint64_t final_total = data->total_points;
-    uint64_t final_hits = data->hit_points;
-    float final_a = data->a;
-    float final_b = data->b;
-
-    pthread_mutex_unlock(&data->mtx);
-
-    // If this is the absolute last process attached, print results and destroy SHM
-    if (current_count == 0) {
-        double result = summarize_calculations(final_total, final_hits, final_a, final_b);
-        printf("\n==================================================\n");
-        printf("ALL PROCESSES DETACHED. FINAL INTEGRATION RESULTS:\n");
-        printf("Lower Bound (a) : %f\n", final_a);
-        printf("Upper Bound (b) : %f\n", final_b);
-        printf("Total Samples   : %lu\n", final_total);
-        printf("Total Hits      : %lu\n", final_hits);
-        printf("Integral Approx : %lf\n", result);
-        printf("==================================================\n");
-
-        if (munmap(data, sizeof(shm_data_t)) == -1) ERR("munmap");
-        if (shm_unlink(SHM_NAME) == -1) ERR("shm_unlink");
-        if (sem_unlink(SEM_NAME) == -1) ERR("sem_unlink");
-        
-        printf("Shared memory properly destroyed.\n");
-    } else {
-        if (munmap(data, sizeof(shm_data_t)) == -1) ERR("munmap");
-    }
-
-    return EXIT_SUCCESS;
-}
+// Then use `while(keep_running)` for your main worker loops.
